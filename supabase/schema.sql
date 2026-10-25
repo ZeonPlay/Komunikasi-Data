@@ -1,84 +1,75 @@
--- Komunikasi Data: secure direct-message schema
--- Run this in Supabase SQL Editor before using the website.
-
-create extension if not exists pgcrypto;
+-- Ruang / Komunikasi Data
+-- Jalankan sekali di Supabase Dashboard > SQL Editor.
+-- Semua tabel menggunakan RLS. Jangan masukkan service_role key ke frontend.
 
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
-  handle text not null unique check (handle ~ '^[a-z0-9_]{3,20}$'),
-  display_name text not null check (char_length(display_name) between 1 and 40),
+  username text not null unique check (username = lower(username) and username ~ '^[a-z0-9_]{3,20}$'),
+  display_name text not null check (char_length(display_name) between 1 and 32),
   created_at timestamptz not null default now()
-);
-
-create table if not exists public.conversations (
-  id uuid primary key default gen_random_uuid(),
-  user_a uuid not null references auth.users(id) on delete cascade,
-  user_b uuid not null references auth.users(id) on delete cascade,
-  created_at timestamptz not null default now(),
-  constraint different_members check (user_a <> user_b),
-  constraint canonical_members check (user_a < user_b),
-  unique (user_a, user_b)
 );
 
 create table if not exists public.messages (
-  id uuid primary key default gen_random_uuid(),
-  conversation_id uuid not null references public.conversations(id) on delete cascade,
-  sender_id uuid not null references auth.users(id) on delete cascade,
-  body text not null check (char_length(body) between 1 and 4000),
-  created_at timestamptz not null default now()
+  id bigint generated always as identity primary key,
+  sender_id uuid not null references public.profiles(id) on delete cascade,
+  recipient_id uuid not null references public.profiles(id) on delete cascade,
+  body text not null check (char_length(body) between 1 and 2000),
+  created_at timestamptz not null default now(),
+  constraint messages_no_self_chat check (sender_id <> recipient_id)
 );
 
-create index if not exists messages_conversation_created_idx
-  on public.messages (conversation_id, created_at);
+create index if not exists messages_sender_created_idx on public.messages (sender_id, created_at desc);
+create index if not exists messages_recipient_created_idx on public.messages (recipient_id, created_at desc);
 
 alter table public.profiles enable row level security;
-alter table public.conversations enable row level security;
 alter table public.messages enable row level security;
 
--- Profiles are searchable by handle; only authenticated clients can read them.
-create policy "Authenticated users can find profiles"
-  on public.profiles for select to authenticated
-  using (true);
+drop policy if exists "Signed-in users can find profiles" on public.profiles;
+drop policy if exists "Authenticated users can find profiles" on public.profiles;
+create policy "Signed-in users can find profiles" on public.profiles for select to authenticated using (true);
 
-create policy "Users can create their own profile"
-  on public.profiles for insert to authenticated
-  with check (id = auth.uid());
+drop policy if exists "Users can insert their own profile" on public.profiles;
+drop policy if exists "Users can create their own profile" on public.profiles;
+create policy "Users can insert their own profile" on public.profiles for insert to authenticated with check ((select auth.uid()) = id);
 
-create policy "Users can update their own profile"
-  on public.profiles for update to authenticated
-  using (id = auth.uid()) with check (id = auth.uid());
+drop policy if exists "Users can update their own profile" on public.profiles;
+create policy "Users can update their own profile" on public.profiles for update to authenticated using ((select auth.uid()) = id) with check ((select auth.uid()) = id);
 
-create policy "Members can read their conversations"
-  on public.conversations for select to authenticated
-  using (auth.uid() = user_a or auth.uid() = user_b);
+drop policy if exists "Participants can read their messages" on public.messages;
+drop policy if exists "Members can read messages" on public.messages;
+create policy "Participants can read their messages" on public.messages for select to authenticated using ((select auth.uid()) = sender_id or (select auth.uid()) = recipient_id);
 
-create policy "Members can create conversations"
-  on public.conversations for insert to authenticated
-  with check (
-    (auth.uid() = user_a or auth.uid() = user_b)
-    and user_a < user_b
-  );
+drop policy if exists "Users can send messages as themselves" on public.messages;
+drop policy if exists "Members can send messages as themselves" on public.messages;
+create policy "Users can send messages as themselves" on public.messages for insert to authenticated with check ((select auth.uid()) = sender_id and sender_id <> recipient_id);
 
-create policy "Members can read messages"
-  on public.messages for select to authenticated
-  using (
-    exists (
-      select 1 from public.conversations c
-      where c.id = conversation_id
-        and (c.user_a = auth.uid() or c.user_b = auth.uid())
-    )
-  );
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = ''
+as $$
+declare requested_username text; requested_name text;
+begin
+  requested_username := lower(coalesce(new.raw_user_meta_data ->> 'username', ''));
+  requested_name := trim(coalesce(new.raw_user_meta_data ->> 'display_name', ''));
+  if requested_username !~ '^[a-z0-9_]{3,20}$' then raise exception 'Username must be 3-20 lowercase letters, digits, or underscores'; end if;
+  if char_length(requested_name) < 1 or char_length(requested_name) > 32 then raise exception 'Display name must be 1-32 characters'; end if;
+  insert into public.profiles (id, username, display_name) values (new.id, requested_username, requested_name);
+  return new;
+end;
+$$;
 
-create policy "Members can send messages as themselves"
-  on public.messages for insert to authenticated
-  with check (
-    sender_id = auth.uid()
-    and exists (
-      select 1 from public.conversations c
-      where c.id = conversation_id
-        and (c.user_a = auth.uid() or c.user_b = auth.uid())
-    )
-  );
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 
--- Realtime messages. If already in publication, ignore the duplicate manually.
-alter publication supabase_realtime add table public.messages;
+do $$
+begin
+  if not exists (select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='messages') then
+    alter publication supabase_realtime add table public.messages;
+  end if;
+exception when undefined_object then
+  raise notice 'Publication supabase_realtime belum tersedia; aktifkan Realtime untuk tabel messages di Dashboard.';
+end $$;
+
+grant usage on schema public to authenticated;
+grant select, insert, update on public.profiles to authenticated;
+grant select, insert on public.messages to authenticated;
+grant usage, select on sequence public.messages_id_seq to authenticated;
