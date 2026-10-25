@@ -2,7 +2,19 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.57.0';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
 
 const $ = (id) => document.getElementById(id);
-const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+// Antrean lock ini mencegah auth gagal hanya karena tab lain masih memegang lock.
+ // Browser modern memakai Web Locks API; jika tidak tersedia, gunakan lock bawaan library.
+const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  auth: {
+    lock: async (name, _acquireTimeout, fn) => {
+      if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+        return navigator.locks.request(name, { mode: 'exclusive' }, () => fn());
+      }
+      // Fallback untuk browser tanpa Web Locks API.
+      return fn();
+    }
+  }
+});
 const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false };
 const COLORS = ['#354b60','#4a3c61','#31574f','#634a40','#3c4e70','#5c4654'];
 let toastTimer;
@@ -129,14 +141,31 @@ function bytesToBits(text){return Array.from(new TextEncoder().encode(text)).map
 function renderEncoding(text) {
   const source=$('encodingSource').value==='sample'?'10110010':bytesToBits(text||'');
   const bits=source.slice(0,64);
-  const start=$('initialLevel').value==='high'?1:0;
+  // Konvensi: bit 1 membalik level di AWAL interval; bit 0 mempertahankan level.
+  // Level awal adalah level sebelum bit pertama diproses.
+  let level=$('initialLevel').value==='high'?1:0;
   $('bitStrip').innerHTML=bits.split('').map((bit,index)=>`<span class="bit-cell ${bit==='1'?'transition':''}" title="Bit ${index+1}: ${bit}">${bit}</span>`).join('');
-  const width= Math.max(360,bits.length*20), left=18, top=15, bottom=116, cell=(width-left*2)/Math.max(bits.length,1);
-  let level=start, path='', labels='', grid='';
-  for(let i=0;i<=bits.length;i++){const x=left+i*cell;grid+=`<path d="M${x} ${top}V${bottom}"/>`;if(i<bits.length){if(bits[i]==='1')level=1-level;const y=level?38:92;if(i===0)path+=`M${x} ${y}`;path+=`H${x+cell}`;labels+=`<text x="${x+cell/2}" y="137" text-anchor="middle">${bits[i]}</text>`;}}
+  const width=Math.max(360,bits.length*20), left=28, top=15, bottom=116;
+  const cell=(width-left*2)/Math.max(bits.length,1);
+  let path='', labels='', grid='';
+  const yFor=(value)=>value?38:92;
+  // Level sebelum bit pertama. Untuk setiap bit, gambar transisi vertikal bila bit=1,
+  // lalu gambar level horizontal sepanjang satu interval bit.
+  path=`M${left} ${yFor(level)}`;
+  for(let i=0;i<bits.length;i++) {
+    const x=left+i*cell;
+    grid+=`<path d="M${x} ${top}V${bottom}"/>`;
+    if(bits[i]==='1') {
+      level=1-level;
+      path+=`V${yFor(level)}`;
+    }
+    path+=`H${x+cell}`;
+    labels+=`<text x="${x+cell/2}" y="137" text-anchor="middle">${bits[i]}</text>`;
+  }
+  grid+=`<path d="M${left+bits.length*cell} ${top}V${bottom}"/>`;
   $('nrzWave').setAttribute('viewBox',`0 0 ${width} 150`);
   $('nrzWave').innerHTML=`<path class="grid" d="M${left} 38H${width-left} M${left} 92H${width-left}"/>${grid}<path class="signal" d="${path}"/>${labels}<text x="3" y="41">H</text><text x="3" y="95">L</text>`;
-  $('encodingSummary').textContent=`Menampilkan ${bits.length} bit pertama dari UTF-8 pesan (${new TextEncoder().encode(text||'').length} byte). Setiap bit 1 membalik level sinyal; bit 0 mempertahankan level. Grafik ini simulasi line coding, bukan enkripsi.`;
+  $('encodingSummary').textContent=`Menampilkan ${bits.length} bit pertama dari UTF-8 pesan (${new TextEncoder().encode(text||'').length} byte). Konvensi: bit 1 menyebabkan transisi di awal interval; bit 0 mempertahankan level. Level yang dipilih adalah level sebelum bit pertama. Ini simulasi line coding, bukan enkripsi.`;
 }
 function toggleEncoding(open) {
   state.encodingOpen=open;
