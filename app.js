@@ -15,7 +15,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     }
   }
 });
-const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false };
+const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '' };
 const COLORS = ['#354b60','#4a3c61','#31574f','#634a40','#3c4e70','#5c4654'];
 let toastTimer;
 const normalizeId = (value) => value.trim().replace(/^@/, '').toLowerCase();
@@ -89,7 +89,11 @@ async function startChatById(rawId) {
 async function openConversation(peerId) {
   const peer=state.chats.find(chat=>chat.id===peerId);
   if(!peer) return;
-  state.peer=peer; state.messages=[];
+  state.peer=peer; state.messages=[]; state.encodingOpen=false; state.encodingText='';
+  $('encodingPanel').classList.add('hidden');
+  $('encodingToggle').classList.remove('active');
+  $('encodingToggle').setAttribute('aria-expanded','false');
+  $('encodingTitle').textContent='NRZ-I · @'+peer.username;
   $('welcomeView').classList.add('hidden'); $('chatView').classList.remove('hidden');
   $('headerTitle').textContent=peer.display_name;
   $('peerAvatar').textContent=initials(peer.display_name); $('peerAvatar').style.background=COLORS[peer.username.charCodeAt(0)%COLORS.length];
@@ -113,17 +117,28 @@ function handleIncoming(message) {
 }
 function renderMessages() {
   const box=$('messages');
-  if(!state.messages.length){box.innerHTML='<div class="message-empty">Ini awal percakapan kalian.<br>Kirim pesan pertama 👋</div>';}
-  else {
-    box.innerHTML=state.messages.map(message=>{
+  if(!state.messages.length){
+    box.innerHTML='<div class="message-empty">Ini awal percakapan kalian.<br>Kirim pesan pertama 👋</div>';
+  } else {
+    box.innerHTML=state.messages.map((message,index)=>{
       const mine=message.sender_id===state.user.id;
       const time=new Date(message.created_at).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
-      return `<article class="message-row ${mine?'mine':''}"><div class="message-author">${mine?'Kamu':escapeText(state.peer?.display_name||'Teman')}</div><div class="message-bubble">${escapeText(message.body)}</div><div class="message-time">${time}</div></article>`;
+      return `<article class="message-row ${mine?'mine':''}">
+        <div class="message-author">${mine?'Kamu':escapeText(state.peer?.display_name||'Teman')}</div>
+        <div class="message-bubble">${escapeText(message.body)}</div>
+        <div class="message-meta-row">
+          <div class="message-time">${time}</div>
+          <button type="button" class="message-encoding-toggle" data-encode-index="${index}" aria-label="Lihat visualisasi NRZ-I untuk pesan ${index+1}">NRZ-I</button>
+        </div>
+      </article>`;
     }).join('');
+    box.querySelectorAll('[data-encode-index]').forEach(button=>button.addEventListener('click',()=>{
+      const message=state.messages[Number(button.dataset.encodeIndex)];
+      if(message) toggleEncoding(true,message.body);
+    }));
   }
   box.scrollTop=box.scrollHeight;
-  const latest=[...state.messages].reverse().find(message=>message.body);
-  if(latest && state.encodingOpen) renderEncoding(latest.body);
+  if(state.encodingOpen) renderEncoding(state.encodingText || '10110010');
 }
 async function sendMessage(event) {
   event.preventDefault();
@@ -167,10 +182,17 @@ function renderEncoding(text) {
   $('nrzWave').innerHTML=`<path class="grid" d="M${left} 38H${width-left} M${left} 92H${width-left}"/>${grid}<path class="signal" d="${path}"/>${labels}<text x="3" y="41">H</text><text x="3" y="95">L</text>`;
   $('encodingSummary').textContent=`Menampilkan ${bits.length} bit pertama dari UTF-8 pesan (${new TextEncoder().encode(text||'').length} byte). Konvensi: bit 1 menyebabkan transisi di awal interval; bit 0 mempertahankan level. Level yang dipilih adalah level sebelum bit pertama. Ini simulasi line coding, bukan enkripsi.`;
 }
-function toggleEncoding(open) {
+function toggleEncoding(open, text) {
   state.encodingOpen=open;
   $('encodingPanel').classList.toggle('hidden',!open);
-  if(open){const latest=[...state.messages].reverse().find(message=>message.body);renderEncoding(latest?.body||'10110010');$('encodingPanel').scrollIntoView({behavior:'smooth',block:'nearest'});}
+  $('encodingToggle').classList.toggle('active',open);
+  $('encodingToggle').setAttribute('aria-expanded',String(open));
+  if(open) {
+    const latest=[...state.messages].reverse().find(message=>message.body);
+    state.encodingText=typeof text==='string'?text:(latest?.body||'10110010');
+    renderEncoding(state.encodingText);
+    $('encodingPanel').scrollTop=0;
+  }
 }
 async function handleAuthSubmit(event) {
   event.preventDefault();feedback('authFeedback','Memproses…');
@@ -223,9 +245,9 @@ $('profileBtn').addEventListener('click',()=>state.profile?showToast('ID kamu: @
 $('peerInfoBtn').addEventListener('click',()=>state.peer&&showToast('ID teman: @'+state.peer.username));
 $('encodingToggle').addEventListener('click',()=>toggleEncoding(!state.encodingOpen));
 $('closeEncoding').addEventListener('click',()=>toggleEncoding(false));
-$('learnNrz').addEventListener('click',()=>toggleEncoding(true));
-$('encodingSource').addEventListener('change',()=>{const latest=[...state.messages].reverse().find(message=>message.body);renderEncoding(latest?.body||'10110010');});
-$('initialLevel').addEventListener('change',()=>{const latest=[...state.messages].reverse().find(message=>message.body);renderEncoding(latest?.body||'10110010');});
+$('learnNrz').addEventListener('click',()=>showToast('Buka percakapan anggota dulu, lalu tekan NRZ-I pada pesan yang ingin dilihat.'));
+$('encodingSource').addEventListener('change',()=>renderEncoding(state.encodingText||'10110010'));
+$('initialLevel').addEventListener('change',()=>renderEncoding(state.encodingText||'10110010'));
 $('mobileMenu').addEventListener('click',()=>$('sidebar').classList.toggle('open'));
 document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>closeModal(button.dataset.close)));
 document.querySelectorAll('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeModal(backdrop.id);}));
