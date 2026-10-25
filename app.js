@@ -94,6 +94,7 @@ async function openConversation(peerId) {
   $('encodingToggle').classList.remove('active');
   $('encodingToggle').setAttribute('aria-expanded','false');
   $('encodingTitle').textContent='NRZ-I · @'+peer.username;
+  $('encodingSource').value='message';
   $('welcomeView').classList.add('hidden'); $('chatView').classList.remove('hidden');
   $('headerTitle').textContent=peer.display_name;
   $('peerAvatar').textContent=initials(peer.display_name); $('peerAvatar').style.background=COLORS[peer.username.charCodeAt(0)%COLORS.length];
@@ -154,7 +155,8 @@ function resizeComposer(){const input=$('messageInput');input.style.height='auto
 function updateCharCount(){$('charCount').textContent=$('messageInput').value.length+' / 2000';}
 function bytesToBits(text){return Array.from(new TextEncoder().encode(text)).map(byte=>byte.toString(2).padStart(8,'0')).join('');}
 function renderEncoding(text) {
-  const source=$('encodingSource').value==='sample'?'10110010':bytesToBits(text||'');
+  const isSample=$('encodingSource').value==='sample';
+  const source=isSample?'10110010':bytesToBits(text||'');
   const bits=source.slice(0,64);
   // Konvensi: bit 1 membalik level di AWAL interval; bit 0 mempertahankan level.
   // Level awal adalah level sebelum bit pertama diproses.
@@ -180,7 +182,9 @@ function renderEncoding(text) {
   grid+=`<path d="M${left+bits.length*cell} ${top}V${bottom}"/>`;
   $('nrzWave').setAttribute('viewBox',`0 0 ${width} 150`);
   $('nrzWave').innerHTML=`<path class="grid" d="M${left} 38H${width-left} M${left} 92H${width-left}"/>${grid}<path class="signal" d="${path}"/>${labels}<text x="3" y="41">H</text><text x="3" y="95">L</text>`;
-  $('encodingSummary').textContent=`Menampilkan ${bits.length} bit pertama dari UTF-8 pesan (${new TextEncoder().encode(text||'').length} byte). Konvensi: bit 1 menyebabkan transisi di awal interval; bit 0 mempertahankan level. Level yang dipilih adalah level sebelum bit pertama. Ini simulasi line coding, bukan enkripsi.`;
+  $('encodingSummary').textContent=isSample
+    ? 'Contoh bit 10110010. Bit 1 membalik level pada awal interval, sedangkan bit 0 mempertahankan level. Level yang dipilih adalah level sebelum bit pertama.'
+    : `Menampilkan ${bits.length} bit pertama dari UTF-8 pesan (${new TextEncoder().encode(text||'').length} byte). Bit 1 membalik level pada awal interval, sedangkan bit 0 mempertahankan level. Ini simulasi line coding, bukan enkripsi.`;
 }
 function toggleEncoding(open, text) {
   state.encodingOpen=open;
@@ -189,7 +193,16 @@ function toggleEncoding(open, text) {
   $('encodingToggle').setAttribute('aria-expanded',String(open));
   if(open) {
     const latest=[...state.messages].reverse().find(message=>message.body);
-    state.encodingText=typeof text==='string'?text:(latest?.body||'10110010');
+    if(typeof text==='string') {
+      state.encodingText=text;
+      $('encodingSource').value='message';
+    } else if(latest) {
+      state.encodingText=latest.body;
+      $('encodingSource').value='message';
+    } else {
+      state.encodingText='10110010';
+      $('encodingSource').value='sample';
+    }
     renderEncoding(state.encodingText);
     $('encodingPanel').scrollTop=0;
   }
