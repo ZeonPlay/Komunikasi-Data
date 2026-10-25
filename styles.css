@@ -15,3 +15,7 @@
   .conversation-head .encoding-chat-toggle{font-size:10px;padding:7px 9px;gap:5px}
   .chat-view .encoding-panel{max-height:38vh;padding:14px}
 }
+
+/* Profile completion uses the same compact modal language as authentication. */
+#profileSubmit:disabled{opacity:.65;cursor:wait}
+#profileFeedback:empty{display:none}

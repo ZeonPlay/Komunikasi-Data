@@ -21,6 +21,7 @@ let toastTimer;
 const normalizeId = (value) => value.trim().replace(/^@/, '').toLowerCase();
 const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const initials = (name) => (name || '?').trim().split(/\s+/).slice(0,2).map(part => part[0] || '').join('').toUpperCase();
+function isPlaceholderProfile(profile) { return /^u_[0-9a-f]{16}$/.test(profile?.username || ''); }
 function showToast(message) { const el=$('toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),3000); }
 function setConnection(online, message) { $('statusDot').classList.toggle('online', online); $('connectionText').textContent=message; }
 function openModal(id) { $(id).classList.remove('hidden'); }
@@ -55,8 +56,29 @@ async function loadProfile(user) {
   const {data,error}=await supabase.from('profiles').select('id,username,display_name').eq('id',user.id).maybeSingle();
   if(error) throw error;
   state.profile=data;
-  if(!data) { showToast('Profil belum ditemukan. Coba keluar lalu daftar kembali.'); return; }
-  renderProfile(); await loadChats();
+  if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
+  renderProfile();
+  if(isPlaceholderProfile(data)) {
+    state.chats=[]; renderChats();
+    openProfileEditor();
+    return;
+  }
+  closeModal('profileModal');
+  await loadChats();
+}
+function openProfileEditor() {
+  if(!state.user) { openModal('authModal'); return; }
+  const pending=isPlaceholderProfile(state.profile);
+  $('profileModalTitle').textContent=pending?'Lengkapi profil':'Pengaturan akun';
+  $('profileModalDescription').textContent=pending
+    ?'Akunmu sudah aktif. Pilih nama tampilan dan ID chat supaya temanmu bisa menemukanmu.'
+    :'Ubah nama tampilan dan ID chat yang digunakan temanmu untuk menghubungimu.';
+  $('profileCloseBtn').classList.toggle('hidden',pending);
+  $('profileDisplayName').value=pending?'':(state.profile?.display_name||'');
+  $('profileUsername').value=pending?'':(state.profile?.username||'');
+  feedback('profileFeedback','');
+  openModal('profileModal');
+  $('profileDisplayName').focus();
 }
 async function loadChats() {
   const {data:sent,error:sentError}=await supabase.from('messages').select('recipient_id').eq('sender_id',state.user.id).limit(500);
@@ -214,7 +236,8 @@ async function handleAuthSubmit(event) {
     if(state.mode==='signup') {
       const username=normalizeId($('customId').value),display_name=$('displayName').value.trim();
       if(!/^[a-z0-9_]{3,20}$/.test(username)){feedback('authFeedback','ID harus 3–20 karakter: huruf, angka, atau garis bawah.');return;}
-      if(display_name.length<1){feedback('authFeedback','Isi nama tampilan.');return;}
+      if(/^u_[0-9a-f]{16}$/.test(username)){feedback('authFeedback','ID ini termasuk format internal. Pilih ID lain.');return;}
+      if(display_name.length<1||display_name.length>32){feedback('authFeedback','Nama tampilan harus 1–32 karakter.');return;}
       const {data,error}=await supabase.auth.signUp({email,password,options:{data:{username,display_name}}});
       if(error)throw error;
       if(data.user && !data.session){feedback('authFeedback','Akun dibuat. Cek email untuk verifikasi, lalu masuk. Jika verifikasi email dimatikan, kamu akan langsung masuk.',true);setAuthMode('login');$('authEmail').value=email;return;}
@@ -227,11 +250,42 @@ async function handleAuthSubmit(event) {
     feedback('authFeedback',message.includes('duplicate key')||message.includes('profiles_username_key')?'ID itu sudah dipakai. Coba ID lain.':message);
   }
 }
+async function handleProfileSubmit(event) {
+  event.preventDefault();
+  if(!state.user) { feedback('profileFeedback','Sesi login tidak ditemukan. Silakan masuk kembali.'); return; }
+  const username=normalizeId($('profileUsername').value);
+  const display_name=$('profileDisplayName').value.trim();
+  if(!/^[a-z0-9_]{3,20}$/.test(username)) {
+    feedback('profileFeedback','ID harus 3–20 karakter: huruf kecil, angka, atau garis bawah.'); return;
+  }
+  if(/^u_[0-9a-f]{16}$/.test(username)) {
+    feedback('profileFeedback','ID ini termasuk format internal. Pilih ID lain.'); return;
+  }
+  if(display_name.length<1||display_name.length>32) {
+    feedback('profileFeedback','Nama tampilan harus 1–32 karakter.'); return;
+  }
+  const button=$('profileSubmit'); button.disabled=true; feedback('profileFeedback','Menyimpan profil…');
+  try {
+    const {data,error}=await supabase.from('profiles')
+      .update({username,display_name}).eq('id',state.user.id)
+      .select('id,username,display_name').single();
+    if(error) throw error;
+    state.profile=data; renderProfile();
+    closeModal('profileModal');
+    await loadChats();
+    showToast('Profil berhasil disimpan.');
+  } catch(error) {
+    const message=error.message||'Profil gagal disimpan.';
+    feedback('profileFeedback',message.includes('duplicate key')||message.includes('profiles_username_key')
+      ?'ID itu sudah dipakai. Coba ID lain.'
+      :message);
+  } finally { button.disabled=false; }
+}
 async function ensureProfile(user,username,display_name) {
   const {error}=await supabase.from('profiles').upsert({id:user.id,username,display_name},{onConflict:'id'});
   if(error)throw error;
 }
-async function signOut() {await supabase.auth.signOut();state.user=null;state.profile=null;state.chats=[];state.peer=null;if(state.channel)await supabase.removeChannel(state.channel);state.channel=null;renderChats();$('chatView').classList.add('hidden');$('welcomeView').classList.remove('hidden');$('headerTitle').textContent='Selamat datang';$('myName').textContent='Belum login';$('myId').textContent='@—';$('myAvatar').textContent='?';setConnection(false,'Belum terhubung');openModal('authModal');setAuthMode('login');}
+async function signOut() {await supabase.auth.signOut();closeModal('profileModal');state.user=null;state.profile=null;state.chats=[];state.peer=null;if(state.channel)await supabase.removeChannel(state.channel);state.channel=null;renderChats();$('chatView').classList.add('hidden');$('welcomeView').classList.remove('hidden');$('headerTitle').textContent='Selamat datang';$('myName').textContent='Belum login';$('myId').textContent='@—';$('myAvatar').textContent='?';setConnection(false,'Belum terhubung');openModal('authModal');setAuthMode('login');}
 async function init() {
   if(!SUPABASE_URL||!SUPABASE_PUBLISHABLE_KEY||SUPABASE_URL.includes('YOUR_PROJECT')) {
     setConnection(false,'Setup diperlukan');
@@ -247,6 +301,7 @@ async function init() {
   });
 }
 $('authForm').addEventListener('submit',handleAuthSubmit);
+$('profileForm').addEventListener('submit',handleProfileSubmit);
 $('messageForm').addEventListener('submit',sendMessage);
 $('messageInput').addEventListener('input',()=>{resizeComposer();updateCharCount();});
 $('messageInput').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();$('messageForm').requestSubmit();}});
@@ -254,7 +309,7 @@ $('addChatBtn').addEventListener('click',()=>{if(!state.user){openModal('authMod
 $('welcomeStart').addEventListener('click',()=>state.user?$('addChatBtn').click():openModal('authModal'));
 $('newChatForm').addEventListener('submit',async event=>{event.preventDefault();await startChatById($('friendId').value);});
 $('logoutBtn').addEventListener('click',()=>{if(state.user)signOut();else openModal('authModal');});
-$('profileBtn').addEventListener('click',()=>state.profile?showToast('ID kamu: @'+state.profile.username):openModal('authModal'));
+$('profileBtn').addEventListener('click',openProfileEditor);
 $('peerInfoBtn').addEventListener('click',()=>state.peer&&showToast('ID teman: @'+state.peer.username));
 $('encodingToggle').addEventListener('click',()=>toggleEncoding(!state.encodingOpen));
 $('closeEncoding').addEventListener('click',()=>toggleEncoding(false));
@@ -263,6 +318,6 @@ $('encodingSource').addEventListener('change',()=>renderEncoding(state.encodingT
 $('initialLevel').addEventListener('change',()=>renderEncoding(state.encodingText||'10110010'));
 $('mobileMenu').addEventListener('click',()=>$('sidebar').classList.toggle('open'));
 document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>closeModal(button.dataset.close)));
-document.querySelectorAll('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeModal(backdrop.id);}));
+document.querySelectorAll('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop&&!(backdrop.id==='profileModal'&&isPlaceholderProfile(state.profile)))closeModal(backdrop.id);}));
 document.querySelectorAll('.auth-tab').forEach(button=>button.addEventListener('click',()=>setAuthMode(button.dataset.mode)));
 init();

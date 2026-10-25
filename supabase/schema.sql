@@ -48,11 +48,21 @@ returns trigger language plpgsql security definer set search_path = ''
 as $$
 declare requested_username text; requested_name text;
 begin
-  requested_username := lower(coalesce(new.raw_user_meta_data ->> 'username', ''));
+  requested_username := lower(trim(coalesce(new.raw_user_meta_data ->> 'username', '')));
   requested_name := trim(coalesce(new.raw_user_meta_data ->> 'display_name', ''));
-  if requested_username !~ '^[a-z0-9_]{3,20}$' then raise exception 'Username must be 3-20 lowercase letters, digits, or underscores'; end if;
-  if char_length(requested_name) < 1 or char_length(requested_name) > 32 then raise exception 'Display name must be 1-32 characters'; end if;
-  insert into public.profiles (id, username, display_name) values (new.id, requested_username, requested_name);
+
+  -- User yang dibuat dari Dashboard Auth biasanya tidak punya metadata profil.
+  -- Buat profil sementara yang valid; aplikasi akan meminta user melengkapinya.
+  if requested_username !~ '^[a-z0-9_]{3,20}$'
+     or requested_username ~ '^u_[0-9a-f]{16}$'
+     or char_length(requested_name) < 1
+     or char_length(requested_name) > 32 then
+    requested_username := 'u_' || substr(replace(new.id::text, '-', ''), 1, 16);
+    requested_name := 'Lengkapi Profil';
+  end if;
+
+  insert into public.profiles (id, username, display_name)
+  values (new.id, requested_username, requested_name);
   return new;
 end;
 $$;
