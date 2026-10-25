@@ -1,0 +1,15 @@
+# Local Supabase credentials
+config.js
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Dependencies / build output (if you add a build tool later)
+node_modules/
+dist/
