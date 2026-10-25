@@ -1,0 +1,7 @@
+// Salin file ini menjadi config.js, lalu isi dari Supabase Dashboard > Project Settings > API.
+// URL dan publishable key aman dipakai di browser jika RLS di schema.sql sudah aktif.
+// JANGAN PERNAH memasukkan service_role/secret key ke file ini.
+export const SUPABASE_URL = 'https://YOUR_PROJECT_REF.supabase.co';
+export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_YOUR_KEY_HERE';
+// Jika project masih memakai key lama, anon public key dapat digunakan sebagai pengganti
+// publishable key. Jangan gunakan service_role key.
