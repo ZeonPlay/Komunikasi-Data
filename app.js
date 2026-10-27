@@ -15,7 +15,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     }
   }
 });
-const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', privateKey: null, publicKey: null };
+const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', privateKey: null, publicKey: null, loginPassword: null };
 
 // E2EE: ECDH P-256 + HKDF-SHA-256 + AES-256-GCM.
 // Private key non-extractable disimpan lokal di IndexedDB; hanya public key yang dikirim ke Supabase.
@@ -48,30 +48,85 @@ async function saveIdentity(identity) {
     request.onerror=()=>reject(request.error);
   });
 }
-async function writeProfilePublicKey(userId, publicKey) {
-  const {error}=await supabase.from('profiles').update({public_key:publicKey}).eq('id',userId);
+async function deriveBackupKey(password, salt) {
+  if (!password) throw new Error('Masukkan password akun untuk membuka kunci E2EE di perangkat ini.');
+  const material = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2', hash:'SHA-256', salt, iterations:600000},
+    material,
+    {name:'AES-GCM', length:256},
+    false,
+    ['encrypt','decrypt']
+  );
+}
+async function encryptPrivateKeyBackup(pkcs8, password) {
+  const salt=crypto.getRandomValues(new Uint8Array(16));
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const key=await deriveBackupKey(password,salt);
+  const ciphertext=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,pkcs8);
+  return JSON.stringify({v:1,salt:toBase64(salt),iv:toBase64(iv),data:toBase64(new Uint8Array(ciphertext))});
+}
+async function decryptPrivateKeyBackup(backup,password) {
+  const envelope=typeof backup==='string'?JSON.parse(backup):backup;
+  if(envelope?.v!==1||!envelope.salt||!envelope.iv||!envelope.data) throw new Error('Cadangan kunci tidak valid.');
+  const key=await deriveBackupKey(password,fromBase64(envelope.salt));
+  try {
+    return await crypto.subtle.decrypt({name:'AES-GCM',iv:fromBase64(envelope.iv)},key,fromBase64(envelope.data));
+  } catch {
+    throw new Error('Password tidak cocok untuk membuka cadangan kunci E2EE. Coba password akun yang benar.');
+  }
+}
+async function writeProfileKeys(userId, publicKey, keyBackup) {
+  const {error}=await supabase.from('profiles').update({public_key:publicKey,key_backup:keyBackup}).eq('id',userId);
   if(error) throw error;
 }
-async function ensureIdentity(profile) {
+async function createIdentity(profile,password) {
+  if(!password) {
+    password=window.prompt('Masukkan password akun untuk membuat cadangan kunci E2EE terenkripsi. Password dipakai lokal dan tidak disimpan oleh aplikasi.');
+    if(!password) throw new Error('Penyiapan kunci dibatalkan. Masuk kembali dan masukkan password akun untuk melanjutkan.');
+  }
+  // Private key sementara dibuat extractable hanya agar bisa dienkripsi sebagai cadangan.
+  // Kunci yang dipakai runtime diimpor ulang sebagai non-extractable.
+  const pair=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits']);
+  const publicKey=toBase64(new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey)));
+  const pkcs8=await crypto.subtle.exportKey('pkcs8',pair.privateKey);
+  const keyBackup=await encryptPrivateKeyBackup(pkcs8,password);
+  const privateKey=await crypto.subtle.importKey('pkcs8',pkcs8,{name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
+  const identity={userId:profile.id,privateKey,publicKey};
+  await writeProfileKeys(profile.id,publicKey,keyBackup);
+  await saveIdentity(identity);
+  return {...identity,keyBackup};
+}
+async function restoreIdentity(profile,password) {
+  if(!profile.key_backup||!profile.public_key) throw new Error('Cadangan kunci akun belum tersedia. Gunakan perangkat lama yang masih memiliki kunci, atau buat kunci baru dengan sadar bahwa pesan lama mungkin tidak bisa dibuka.');
+  if(!password) password=window.prompt('Masukkan password akun untuk membuka kunci E2EE di perangkat ini.');
+  if(!password) throw new Error('Pembukaan kunci dibatalkan.');
+  const pkcs8=await decryptPrivateKeyBackup(profile.key_backup,password);
+  const privateKey=await crypto.subtle.importKey('pkcs8',pkcs8,{name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
+  const identity={userId:profile.id,privateKey,publicKey:profile.public_key};
+  await saveIdentity(identity);
+  return identity;
+}
+async function ensureIdentity(profile,password) {
   let identity=await readIdentity(profile.id);
-  if(identity) {
-    if(profile.public_key && profile.public_key!==identity.publicKey) {
-      throw new Error('Kunci akun di server berbeda dengan kunci di perangkat ini. Jangan kirim pesan; kemungkinan kamu masuk dari perangkat lain atau kunci berubah.');
-    }
-    if(!profile.public_key) await writeProfilePublicKey(profile.id,identity.publicKey);
+  const backupExists=Boolean(profile.key_backup&&profile.public_key);
+  if(identity && identity.publicKey===profile.public_key && profile.key_backup) {
+    state.privateKey=identity.privateKey;
+    state.publicKey=identity.publicKey;
+    state.profile={...profile};
+    return;
+  }
+  if(backupExists) {
+    identity=await restoreIdentity(profile,password);
   } else {
-    if(profile.public_key && !window.confirm('Kunci privat untuk akun ini tidak ditemukan di perangkat ini. Membuat kunci baru akan membuat pesan lama tidak bisa dibuka di perangkat ini dan mengganti kunci publik akun. Lanjutkan hanya jika ini memang perangkat baru atau kamu siap kehilangan akses ke pesan lama.')) {
-      throw new Error('Pembuatan kunci dibatalkan. Gunakan perangkat yang menyimpan kunci privat lama, jika masih tersedia.');
+    if(profile.public_key && !window.confirm('Akun ini masih memakai kunci E2EE versi lama yang tidak memiliki cadangan lintas perangkat. Membuat kunci baru membuat pesan lama yang memakai kunci lama tidak dapat dibuka. Lanjutkan migrasi kunci?')) {
+      throw new Error('Migrasi kunci dibatalkan. Perangkat ini tetap perlu kunci cadangan agar bisa dipakai lintas perangkat.');
     }
-    const pair=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
-    const publicKey=toBase64(new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey)));
-    identity={userId:profile.id,privateKey:pair.privateKey,publicKey};
-    await saveIdentity(identity);
-    await writeProfilePublicKey(profile.id,publicKey);
+    identity=await createIdentity(profile,password);
   }
   state.privateKey=identity.privateKey;
   state.publicKey=identity.publicKey;
-  state.profile={...profile,public_key:identity.publicKey};
+  state.profile={...profile,public_key:identity.publicKey,key_backup:identity.keyBackup||profile.key_backup};
 }
 async function importPeerPublicKey(encoded) {
   if(!encoded) throw new Error('Teman belum memiliki kunci publik. Minta teman login ulang setelah migrasi E2EE diterapkan.');
@@ -153,10 +208,10 @@ function renderChats() {
   list.querySelectorAll('[data-peer]').forEach(button=>button.addEventListener('click',()=>openConversation(button.dataset.peer)));
 }
 async function loadProfile(user) {
-  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('id',user.id).maybeSingle();
+  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key,key_backup').eq('id',user.id).maybeSingle();
   if(error) throw error;
   if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
-  try { await ensureIdentity(data); }
+  try { await ensureIdentity(data,state.loginPassword); state.loginPassword=null; }
   catch(keyError) { showToast('Gagal menyiapkan E2EE: '+keyError.message); throw keyError; }
   renderProfile();
   if(isPlaceholderProfile(data)) {
@@ -350,14 +405,15 @@ async function handleAuthSubmit(event) {
       if(!/^[a-z0-9_]{3,20}$/.test(username)){feedback('authFeedback','ID harus 3–20 karakter: huruf, angka, atau garis bawah.');return;}
       if(/^u_[0-9a-f]{16}$/.test(username)){feedback('authFeedback','ID ini termasuk format internal. Pilih ID lain.');return;}
       if(display_name.length<1||display_name.length>32){feedback('authFeedback','Nama tampilan harus 1–32 karakter.');return;}
-      const {data,error}=await supabase.auth.signUp({email,password,options:{data:{username,display_name}}});
+      state.loginPassword=password; const {data,error}=await supabase.auth.signUp({email,password,options:{data:{username,display_name}}});
       if(error)throw error;
       if(data.user && !data.session){feedback('authFeedback','Akun dibuat. Cek email untuk verifikasi, lalu masuk. Jika verifikasi email dimatikan, kamu akan langsung masuk.',true);setAuthMode('login');$('authEmail').value=email;return;}
       if(data.session){await ensureProfile(data.user,username,display_name);closeModal('authModal');showToast('Akun berhasil dibuat!');}
     } else {
-      const {error}=await supabase.auth.signInWithPassword({email,password});if(error)throw error;closeModal('authModal');showToast('Berhasil masuk.');
+      state.loginPassword=password; const {error}=await supabase.auth.signInWithPassword({email,password});if(error)throw error;closeModal('authModal');showToast('Berhasil masuk.');
     }
   } catch(error) {
+    state.loginPassword=null;
     const message=error.message||'Terjadi kesalahan.';
     feedback('authFeedback',message.includes('duplicate key')||message.includes('profiles_username_key')?'ID itu sudah dipakai. Coba ID lain.':message);
   }
