@@ -220,8 +220,7 @@ async function loadProfile(user) {
   const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('id',user.id).maybeSingle();
   if(error) throw error;
   if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
-  try { await ensureIdentity(data,state.loginPassword); state.loginPassword=null; }
-  catch(keyError) { state.loginPassword=null; showToast('Gagal menyiapkan E2EE: '+keyError.message); throw keyError; }
+  state.loginPassword=null;
   renderProfile();
   if(isPlaceholderProfile(data)) {
     state.chats=[]; renderChats();
@@ -251,12 +250,12 @@ async function loadChats() {
   if(sentError||receivedError) { showToast('Gagal memuat daftar chat. Periksa setup database.'); return; }
   const ids=[...new Set([...(sent||[]).map(x=>x.recipient_id),...(received||[]).map(x=>x.sender_id)])].filter(id=>id!==state.user.id);
   if(!ids.length){state.chats=[];renderChats();return;}
-  const {data:profiles,error}=await supabase.from('profiles').select('id,username,display_name,public_key').in('id',ids);
+  const {data:profiles,error}=await supabase.from('profiles').select('id,username,display_name').in('id',ids);
   if(error){showToast('Tidak bisa memuat profil teman.');return;}
   state.chats=profiles||[]; state.chats.sort((a,b)=>a.display_name.localeCompare(b.display_name)); renderChats();
 }
 async function findFriend(id) {
-  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('username',normalizeId(id)).maybeSingle();
+  const {data,error}=await supabase.from('profiles').select('id,username,display_name').eq('username',normalizeId(id)).maybeSingle();
   if(error) throw error;
   return data;
 }
@@ -283,9 +282,7 @@ async function showPeerFingerprint() {
 async function openConversation(peerId) {
   const peer=state.chats.find(chat=>chat.id===peerId);
   if(!peer) return;
-  state.peer=peer; state.messages=[]; state.peer.public_key=peer.public_key; state.encodingOpen=false; state.encodingText='';
-  if(!state.privateKey) { showToast('Kunci privat perangkat tidak tersedia. Keluar dan masuk kembali.'); return; }
-  if(!peer.public_key) { showToast('Teman belum punya kunci publik. Minta teman login ulang setelah migrasi E2EE.'); return; }
+  state.peer=peer; state.messages=[]; state.encodingOpen=false; state.encodingText='';
   $('encodingPanel').classList.add('hidden');
   $('encodingToggle').classList.remove('active');
   $('encodingToggle').setAttribute('aria-expanded','false');
@@ -300,7 +297,7 @@ async function openConversation(peerId) {
   if(state.channel){await supabase.removeChannel(state.channel);state.channel=null;}
   const {data,error}=await supabase.from('messages').select('id,sender_id,recipient_id,body,created_at').or(`and(sender_id.eq.${state.user.id},recipient_id.eq.${peer.id}),and(sender_id.eq.${peer.id},recipient_id.eq.${state.user.id})`).order('created_at',{ascending:true}).limit(300);
   if(error){showToast('Gagal memuat pesan. Periksa kebijakan RLS database.');return;}
-  state.messages=await Promise.all((data||[]).map(decryptMessage)); renderMessages();
+  state.messages=(data||[]).map(message=>({...message,plaintext:message.body})); renderMessages();
   state.channel=supabase.channel('chat:'+ [state.user.id,peer.id].sort().join(':'))
     .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:`recipient_id=eq.${state.user.id}`},payload=>handleIncoming(payload.new))
     .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:`sender_id=eq.${state.user.id}`},payload=>handleIncoming(payload.new))
@@ -309,7 +306,9 @@ async function openConversation(peerId) {
 function handleIncoming(message) {
   if(!state.peer||![state.user.id,state.peer.id].includes(message.sender_id)||![state.user.id,state.peer.id].includes(message.recipient_id)) return;
   if(state.messages.some(item=>item.id===message.id)) return;
-  decryptMessage(message).then(decoded=>{ if(state.messages.some(item=>item.id===decoded.id)) return; state.messages.push(decoded);state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));renderMessages(); });
+  const decoded={...message,plaintext:message.body};
+  if(state.messages.some(item=>item.id===decoded.id)) return;
+  state.messages.push(decoded);state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));renderMessages();
   if(message.sender_id!==state.user.id) renderChats();
 }
 function renderMessages() {
@@ -342,12 +341,10 @@ async function sendMessage(event) {
   const body=$('messageInput').value.trim();
   if(!body||!state.peer||!state.user) return;
   $('sendBtn').disabled=true;
-  if(!state.privateKey||!state.peer?.public_key) { showToast('Kunci E2EE belum siap. Pastikan kunci publik teman tersedia.'); $('sendBtn').disabled=false; return; }
-  let encryptedBody; try { encryptedBody=await encryptMessage(body); } catch(error) { showToast(error.message); $('sendBtn').disabled=false; return; }
-  const {data,error}=await supabase.from('messages').insert({sender_id:state.user.id,recipient_id:state.peer.id,body:encryptedBody}).select('id,sender_id,recipient_id,body,created_at').single();
+  const {data,error}=await supabase.from('messages').insert({sender_id:state.user.id,recipient_id:state.peer.id,body}).select('id,sender_id,recipient_id,body,created_at').single();
   $('sendBtn').disabled=false;
   if(error){showToast(error.message.includes('row-level security')?'Pesan ditolak oleh aturan keamanan database. Periksa schema.sql.':'Pesan gagal dikirim. Periksa koneksi.');return;}
-  state.messages.push({...data,plaintext:body,encrypted:true}); state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at)); renderMessages(); $('messageInput').value='';resizeComposer();updateCharCount();
+  state.messages.push({...data,plaintext:body}); state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at)); renderMessages(); $('messageInput').value='';resizeComposer();updateCharCount();
 }
 function resizeComposer(){const input=$('messageInput');input.style.height='auto';input.style.height=Math.min(input.scrollHeight,130)+'px';}
 function updateCharCount(){$('charCount').textContent=$('messageInput').value.length+' / 2000';}
@@ -487,7 +484,7 @@ $('welcomeStart').addEventListener('click',()=>state.user?$('addChatBtn').click(
 $('newChatForm').addEventListener('submit',async event=>{event.preventDefault();await startChatById($('friendId').value);});
 $('logoutBtn').addEventListener('click',()=>{if(state.user)signOut();else openModal('authModal');});
 $('profileBtn').addEventListener('click',openProfileEditor);
-$('peerInfoBtn').addEventListener('click',()=>state.peer&&showPeerFingerprint().catch(error=>showToast(error.message||'Fingerprint gagal dibuat.')));
+$('peerInfoBtn').addEventListener('click',()=>state.peer&&window.alert('ID kontak: @'+state.peer.username+'\nPesan dikirim langsung ke akun ini.'));
 $('encodingToggle').addEventListener('click',()=>toggleEncoding(!state.encodingOpen));
 $('closeEncoding').addEventListener('click',()=>toggleEncoding(false));
 $('learnNrz').addEventListener('click',()=>showToast('Buka percakapan anggota dulu, lalu tekan NRZ-I pada pesan yang ingin dilihat.'));
