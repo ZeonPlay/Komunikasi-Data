@@ -77,8 +77,15 @@ async function decryptPrivateKeyBackup(backup,password) {
   }
 }
 async function writeProfileKeys(userId, publicKey, keyBackup) {
-  const {error}=await supabase.from('profiles').update({public_key:publicKey,key_backup:keyBackup}).eq('id',userId);
+  const {error:profileError}=await supabase.from('profiles').update({public_key:publicKey}).eq('id',userId);
+  if(profileError) throw profileError;
+  const {error:backupError}=await supabase.from('private_key_backups').upsert({user_id:userId,key_backup:keyBackup,updated_at:new Date().toISOString()},{onConflict:'user_id'});
+  if(backupError) throw backupError;
+}
+async function loadPrivateKeyBackup(userId) {
+  const {data,error}=await supabase.from('private_key_backups').select('key_backup').eq('user_id',userId).maybeSingle();
   if(error) throw error;
+  return data?.key_backup||null;
 }
 async function createIdentity(profile,password) {
   if(!password) {
@@ -109,6 +116,8 @@ async function restoreIdentity(profile,password) {
 }
 async function ensureIdentity(profile,password) {
   let identity=await readIdentity(profile.id);
+  const keyBackup=await loadPrivateKeyBackup(profile.id);
+  profile={...profile,key_backup:keyBackup};
   const backupExists=Boolean(profile.key_backup&&profile.public_key);
   if(identity && identity.publicKey===profile.public_key && profile.key_backup) {
     state.privateKey=identity.privateKey;
@@ -208,7 +217,7 @@ function renderChats() {
   list.querySelectorAll('[data-peer]').forEach(button=>button.addEventListener('click',()=>openConversation(button.dataset.peer)));
 }
 async function loadProfile(user) {
-  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key,key_backup').eq('id',user.id).maybeSingle();
+  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('id',user.id).maybeSingle();
   if(error) throw error;
   if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
   try { await ensureIdentity(data,state.loginPassword); state.loginPassword=null; }
