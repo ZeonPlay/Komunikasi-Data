@@ -7,7 +7,6 @@ create table if not exists public.profiles (
   username text not null unique check (username = lower(username) and username ~ '^[a-z0-9_]{3,20}$'),
   display_name text not null check (char_length(display_name) between 1 and 32),
   public_key text,
-  key_backup text,
   created_at timestamptz not null default now()
 );
 
@@ -24,13 +23,20 @@ create index if not exists messages_sender_created_idx on public.messages (sende
 create index if not exists messages_recipient_created_idx on public.messages (recipient_id, created_at desc);
 
 alter table public.profiles add column if not exists public_key text;
-alter table public.profiles add column if not exists key_backup text;
+
+-- Cadangan private key terenkripsi dipisahkan agar tidak terlihat oleh pengguna lain.
+create table if not exists public.private_key_backups (
+  user_id uuid primary key references public.profiles(id) on delete cascade,
+  key_backup text not null,
+  updated_at timestamptz not null default now()
+);
 
 alter table public.messages drop constraint if exists messages_body_check;
 alter table public.messages add constraint messages_body_check check (char_length(body) between 1 and 12000);
 
 alter table public.profiles enable row level security;
 alter table public.messages enable row level security;
+alter table public.private_key_backups enable row level security;
 
 drop policy if exists "Signed-in users can find profiles" on public.profiles;
 drop policy if exists "Authenticated users can find profiles" on public.profiles;
@@ -42,6 +48,13 @@ create policy "Users can insert their own profile" on public.profiles for insert
 
 drop policy if exists "Users can update their own profile" on public.profiles;
 create policy "Users can update their own profile" on public.profiles for update to authenticated using ((select auth.uid()) = id) with check ((select auth.uid()) = id);
+
+drop policy if exists "Users can read their own key backup" on public.private_key_backups;
+create policy "Users can read their own key backup" on public.private_key_backups for select to authenticated using ((select auth.uid()) = user_id);
+drop policy if exists "Users can insert their own key backup" on public.private_key_backups;
+create policy "Users can insert their own key backup" on public.private_key_backups for insert to authenticated with check ((select auth.uid()) = user_id);
+drop policy if exists "Users can update their own key backup" on public.private_key_backups;
+create policy "Users can update their own key backup" on public.private_key_backups for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
 
 drop policy if exists "Participants can read their messages" on public.messages;
 drop policy if exists "Members can read messages" on public.messages;
@@ -89,5 +102,6 @@ end $$;
 
 grant usage on schema public to authenticated;
 grant select, insert, update on public.profiles to authenticated;
+grant select, insert, update on public.private_key_backups to authenticated;
 grant select, insert on public.messages to authenticated;
 grant usage, select on sequence public.messages_id_seq to authenticated;
