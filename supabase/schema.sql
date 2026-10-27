@@ -7,6 +7,7 @@ create table if not exists public.profiles (
   username text not null unique check (username = lower(username) and username ~ '^[a-z0-9_]{3,20}$'),
   display_name text not null check (char_length(display_name) between 1 and 32),
   public_key text,
+  key_backup text,
   created_at timestamptz not null default now()
 );
 
@@ -23,6 +24,7 @@ create index if not exists messages_sender_created_idx on public.messages (sende
 create index if not exists messages_recipient_created_idx on public.messages (recipient_id, created_at desc);
 
 alter table public.profiles add column if not exists public_key text;
+alter table public.profiles add column if not exists key_backup text;
 
 alter table public.messages drop constraint if exists messages_body_check;
 alter table public.messages add constraint messages_body_check check (char_length(body) between 1 and 12000);
