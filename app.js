@@ -18,7 +18,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
 const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', privateKey: null, publicKey: null, loginPassword: null };
 
 // E2EE: ECDH P-256 + HKDF-SHA-256 + AES-256-GCM.
-// Private key non-extractable disimpan lokal di IndexedDB; hanya public key yang dikirim ke Supabase.
+// Private key runtime non-extractable disimpan lokal. Cadangan private key dikirim ke Supabase hanya dalam bentuk terenkripsi dengan password akun.
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const KEY_DB = 'ruang-e2ee-key-store';
@@ -212,7 +212,7 @@ async function loadProfile(user) {
   if(error) throw error;
   if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
   try { await ensureIdentity(data,state.loginPassword); state.loginPassword=null; }
-  catch(keyError) { showToast('Gagal menyiapkan E2EE: '+keyError.message); throw keyError; }
+  catch(keyError) { state.loginPassword=null; showToast('Gagal menyiapkan E2EE: '+keyError.message); throw keyError; }
   renderProfile();
   if(isPlaceholderProfile(data)) {
     state.chats=[]; renderChats();
