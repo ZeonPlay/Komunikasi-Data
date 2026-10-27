@@ -6,6 +6,7 @@ create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   username text not null unique check (username = lower(username) and username ~ '^[a-z0-9_]{3,20}$'),
   display_name text not null check (char_length(display_name) between 1 and 32),
+  public_key text,
   created_at timestamptz not null default now()
 );
 
@@ -13,13 +14,18 @@ create table if not exists public.messages (
   id bigint generated always as identity primary key,
   sender_id uuid not null references public.profiles(id) on delete cascade,
   recipient_id uuid not null references public.profiles(id) on delete cascade,
-  body text not null check (char_length(body) between 1 and 2000),
+  body text not null check (char_length(body) between 1 and 12000),
   created_at timestamptz not null default now(),
   constraint messages_no_self_chat check (sender_id <> recipient_id)
 );
 
 create index if not exists messages_sender_created_idx on public.messages (sender_id, created_at desc);
 create index if not exists messages_recipient_created_idx on public.messages (recipient_id, created_at desc);
+
+alter table public.profiles add column if not exists public_key text;
+
+alter table public.messages drop constraint if exists messages_body_check;
+alter table public.messages add constraint messages_body_check check (char_length(body) between 1 and 12000);
 
 alter table public.profiles enable row level security;
 alter table public.messages enable row level security;

@@ -15,39 +15,106 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     }
   }
 });
-const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', cryptoKey: null, cryptoSalt: null };
+const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', privateKey: null, publicKey: null };
 
-// Enkripsi ujung-ke-ujung edukatif: AES-GCM berjalan di browser.
+// E2EE: ECDH P-256 + HKDF-SHA-256 + AES-256-GCM.
+// Private key non-extractable disimpan lokal di IndexedDB; hanya public key yang dikirim ke Supabase.
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-function conversationSalt(a,b) { return encoder.encode(['ruang-e2ee-v1', ...[a,b].sort()].join(':')); }
-async function deriveChatKey(passphrase, salt) {
-  const material = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:310000,hash:'SHA-256'}, material, {name:'AES-GCM',length:256}, false, ['encrypt','decrypt']);
-}
+const KEY_DB = 'ruang-e2ee-key-store';
 function toBase64(bytes) { let binary=''; for(const byte of bytes) binary+=String.fromCharCode(byte); return btoa(binary); }
 function fromBase64(value) { return Uint8Array.from(atob(value), c=>c.charCodeAt(0)); }
+function openKeyDb() {
+  return new Promise((resolve,reject)=>{
+    const request=indexedDB.open(KEY_DB,1);
+    request.onupgradeneeded=()=>request.result.createObjectStore('identities',{keyPath:'userId'});
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+}
+async function readIdentity(userId) {
+  const db=await openKeyDb();
+  return new Promise((resolve,reject)=>{
+    const request=db.transaction('identities','readonly').objectStore('identities').get(userId);
+    request.onsuccess=()=>resolve(request.result||null);
+    request.onerror=()=>reject(request.error);
+  });
+}
+async function saveIdentity(identity) {
+  const db=await openKeyDb();
+  return new Promise((resolve,reject)=>{
+    const request=db.transaction('identities','readwrite').objectStore('identities').put(identity);
+    request.onsuccess=()=>resolve();
+    request.onerror=()=>reject(request.error);
+  });
+}
+async function writeProfilePublicKey(userId, publicKey) {
+  const {error}=await supabase.from('profiles').update({public_key:publicKey}).eq('id',userId);
+  if(error) throw error;
+}
+async function ensureIdentity(profile) {
+  let identity=await readIdentity(profile.id);
+  if(identity) {
+    if(profile.public_key && profile.public_key!==identity.publicKey) {
+      throw new Error('Kunci akun di server berbeda dengan kunci di perangkat ini. Jangan kirim pesan; kemungkinan kamu masuk dari perangkat lain atau kunci berubah.');
+    }
+    if(!profile.public_key) await writeProfilePublicKey(profile.id,identity.publicKey);
+  } else {
+    if(profile.public_key && !window.confirm('Kunci privat untuk akun ini tidak ditemukan di perangkat ini. Membuat kunci baru akan membuat pesan lama tidak bisa dibuka di perangkat ini dan mengganti kunci publik akun. Lanjutkan hanya jika ini memang perangkat baru atau kamu siap kehilangan akses ke pesan lama.')) {
+      throw new Error('Pembuatan kunci dibatalkan. Gunakan perangkat yang menyimpan kunci privat lama, jika masih tersedia.');
+    }
+    const pair=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
+    const publicKey=toBase64(new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey)));
+    identity={userId:profile.id,privateKey:pair.privateKey,publicKey};
+    await saveIdentity(identity);
+    await writeProfilePublicKey(profile.id,publicKey);
+  }
+  state.privateKey=identity.privateKey;
+  state.publicKey=identity.publicKey;
+  state.profile={...profile,public_key:identity.publicKey};
+}
+async function importPeerPublicKey(encoded) {
+  if(!encoded) throw new Error('Teman belum memiliki kunci publik. Minta teman login ulang setelah migrasi E2EE diterapkan.');
+  return crypto.subtle.importKey('raw',fromBase64(encoded),{name:'ECDH',namedCurve:'P-256'},false,[]);
+}
+async function deriveMessageKey(privateKey, peerPublicKey, userA, userB) {
+  const shared=await crypto.subtle.deriveBits({name:'ECDH',public:peerPublicKey},privateKey,256);
+  const material=await crypto.subtle.importKey('raw',shared,'HKDF',false,['deriveKey']);
+  const salt=encoder.encode(['ruang-e2ee-v2',...([userA,userB].sort())].join(':'));
+  return crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt,info:encoder.encode('ruang-message-encryption')},material,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
 async function encryptMessage(plain) {
-  if(!state.cryptoKey) throw new Error('Kunci chat belum disiapkan.');
+  if(!state.privateKey||!state.publicKey||!state.peer?.public_key) throw new Error('Kunci E2EE belum siap. Pastikan teman sudah membuat kunci publik.');
+  const peerKey=await importPeerPublicKey(state.peer.public_key);
+  const key=await deriveMessageKey(state.privateKey,peerKey,state.user.id,state.peer.id);
   const iv=crypto.getRandomValues(new Uint8Array(12));
-  const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv},state.cryptoKey,encoder.encode(plain));
-  return 'E2EE1:'+toBase64(new Uint8Array([...iv,...new Uint8Array(encrypted)]));
+  const aad=encoder.encode(state.user.id+':'+state.peer.id);
+  const data=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:aad},key,encoder.encode(plain));
+  return 'E2EE2:'+toBase64(encoder.encode(JSON.stringify({v:2,senderPublicKey:state.publicKey,iv:toBase64(iv),data:toBase64(new Uint8Array(data))})));
 }
 async function decryptMessage(message) {
-  if(!message.body?.startsWith('E2EE1:')) return {...message,plaintext:message.body,encrypted:false};
+  if(!message.body?.startsWith('E2EE2:')) {
+    if(message.body?.startsWith('E2EE1:')) return {...message,plaintext:'🔒 Pesan lama memakai format passphrase; tidak dapat dibuka dengan kunci E2EE baru.',encrypted:true,undecryptable:true};
+    return {...message,plaintext:message.body,encrypted:false};
+  }
   try {
-    if(!state.cryptoKey) throw new Error('Kunci tidak tersedia');
-    const packed=fromBase64(message.body.slice(6));
-    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:packed.slice(0,12)},state.cryptoKey,packed.slice(12));
+    if(!state.privateKey||!state.peer?.public_key) throw new Error('Kunci belum tersedia');
+    const envelope=JSON.parse(decoder.decode(fromBase64(message.body.slice(6))));
+    if(envelope.v!==2||!envelope.senderPublicKey||!envelope.iv||!envelope.data) throw new Error('Format tidak dikenal');
+    let peerKey;
+    if(message.sender_id===state.user.id) {
+      peerKey=await importPeerPublicKey(state.peer.public_key);
+    } else {
+      if(envelope.senderPublicKey!==state.peer.public_key) throw new Error('Kunci pengirim tidak cocok dengan kunci publik profil');
+      peerKey=await importPeerPublicKey(envelope.senderPublicKey);
+    }
+    const key=await deriveMessageKey(state.privateKey,peerKey,state.user.id,state.peer.id);
+    const aad=encoder.encode(message.sender_id+':'+message.recipient_id);
+    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:fromBase64(envelope.iv),additionalData:aad},key,fromBase64(envelope.data));
     return {...message,plaintext:decoder.decode(plain),encrypted:true};
-  } catch { return {...message,plaintext:'🔒 Pesan terkunci — frasa rahasia salah/tidak tersedia',encrypted:true,undecryptable:true}; }
-}
-async function prepareConversationKey(peer) {
-  const passphrase=window.prompt('ENKRIPSI UJUNG-KE-UJUNG (AES-256-GCM)\nMasukkan frasa rahasia bersama untuk chat dengan @'+peer.username+'. Temanmu harus memasukkan frasa yang SAMA. Minimal 8 karakter. Jangan kirim frasa ini lewat chat.');
-  if(!passphrase || passphrase.length<8) { state.cryptoKey=null; showToast('Kunci tidak disiapkan. Chat terenkripsi tidak dapat dibaca/dikirim.'); return false; }
-  state.cryptoSalt=conversationSalt(state.user.id,peer.id);
-  state.cryptoKey=await deriveChatKey(passphrase,state.cryptoSalt);
-  return true;
+  } catch {
+    return {...message,plaintext:'🔒 Pesan terkunci — kunci tidak cocok atau pesan tidak valid.',encrypted:true,undecryptable:true};
+  }
 }
 const COLORS = ['#354b60','#4a3c61','#31574f','#634a40','#3c4e70','#5c4654'];
 let toastTimer;
@@ -86,10 +153,11 @@ function renderChats() {
   list.querySelectorAll('[data-peer]').forEach(button=>button.addEventListener('click',()=>openConversation(button.dataset.peer)));
 }
 async function loadProfile(user) {
-  const {data,error}=await supabase.from('profiles').select('id,username,display_name').eq('id',user.id).maybeSingle();
+  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('id',user.id).maybeSingle();
   if(error) throw error;
-  state.profile=data;
   if(!data) { showToast('Profil belum ditemukan. Periksa trigger handle_new_user di database.'); return; }
+  try { await ensureIdentity(data); }
+  catch(keyError) { showToast('Gagal menyiapkan E2EE: '+keyError.message); throw keyError; }
   renderProfile();
   if(isPlaceholderProfile(data)) {
     state.chats=[]; renderChats();
@@ -119,12 +187,12 @@ async function loadChats() {
   if(sentError||receivedError) { showToast('Gagal memuat daftar chat. Periksa setup database.'); return; }
   const ids=[...new Set([...(sent||[]).map(x=>x.recipient_id),...(received||[]).map(x=>x.sender_id)])].filter(id=>id!==state.user.id);
   if(!ids.length){state.chats=[];renderChats();return;}
-  const {data:profiles,error}=await supabase.from('profiles').select('id,username,display_name').in('id',ids);
+  const {data:profiles,error}=await supabase.from('profiles').select('id,username,display_name,public_key').in('id',ids);
   if(error){showToast('Tidak bisa memuat profil teman.');return;}
   state.chats=profiles||[]; state.chats.sort((a,b)=>a.display_name.localeCompare(b.display_name)); renderChats();
 }
 async function findFriend(id) {
-  const {data,error}=await supabase.from('profiles').select('id,username,display_name').eq('username',normalizeId(id)).maybeSingle();
+  const {data,error}=await supabase.from('profiles').select('id,username,display_name,public_key').eq('username',normalizeId(id)).maybeSingle();
   if(error) throw error;
   return data;
 }
@@ -141,11 +209,19 @@ async function startChatById(rawId) {
     await openConversation(friend.id); $('sidebar').classList.remove('open');
   } catch(error){feedback('newChatFeedback',error.message||'Pencarian gagal. Periksa koneksi dan database.');}
 }
+async function showPeerFingerprint() {
+  if(!state.peer?.public_key) { showToast('Teman belum memiliki kunci publik.'); return; }
+  const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',fromBase64(state.peer.public_key)));
+  const hex=Array.from(digest,byte=>byte.toString(16).padStart(2,'0').toUpperCase()).join('');
+  const fingerprint=hex.match(/.{1,4}/g).join(' ');
+  window.alert('Fingerprint kunci publik @'+state.peer.username+'\n\n'+fingerprint+'\n\nBandingkan fingerprint ini dengan teman melalui kanal lain (misalnya bertemu langsung atau panggilan yang kamu yakini aman). Jika tidak cocok, jangan kirim pesan sensitif.');
+}
 async function openConversation(peerId) {
   const peer=state.chats.find(chat=>chat.id===peerId);
   if(!peer) return;
-  state.peer=peer; state.messages=[]; state.cryptoKey=null;
-  await prepareConversationKey(peer); state.encodingOpen=false; state.encodingText='';
+  state.peer=peer; state.messages=[]; state.peer.public_key=peer.public_key; state.encodingOpen=false; state.encodingText='';
+  if(!state.privateKey) { showToast('Kunci privat perangkat tidak tersedia. Keluar dan masuk kembali.'); return; }
+  if(!peer.public_key) { showToast('Teman belum punya kunci publik. Minta teman login ulang setelah migrasi E2EE.'); return; }
   $('encodingPanel').classList.add('hidden');
   $('encodingToggle').classList.remove('active');
   $('encodingToggle').setAttribute('aria-expanded','false');
@@ -202,7 +278,7 @@ async function sendMessage(event) {
   const body=$('messageInput').value.trim();
   if(!body||!state.peer||!state.user) return;
   $('sendBtn').disabled=true;
-  if(!state.cryptoKey) { showToast('Kunci enkripsi belum tersedia. Buka ulang chat dan masukkan frasa rahasia.'); $('sendBtn').disabled=false; return; }
+  if(!state.privateKey||!state.peer?.public_key) { showToast('Kunci E2EE belum siap. Pastikan kunci publik teman tersedia.'); $('sendBtn').disabled=false; return; }
   let encryptedBody; try { encryptedBody=await encryptMessage(body); } catch(error) { showToast(error.message); $('sendBtn').disabled=false; return; }
   const {data,error}=await supabase.from('messages').insert({sender_id:state.user.id,recipient_id:state.peer.id,body:encryptedBody}).select('id,sender_id,recipient_id,body,created_at').single();
   $('sendBtn').disabled=false;
@@ -306,7 +382,7 @@ async function handleProfileSubmit(event) {
       .update({username,display_name}).eq('id',state.user.id)
       .select('id,username,display_name').single();
     if(error) throw error;
-    state.profile=data; renderProfile();
+    state.profile={...data,public_key:state.publicKey}; renderProfile();
     closeModal('profileModal');
     await loadChats();
     showToast('Profil berhasil disimpan.');
@@ -346,7 +422,7 @@ $('welcomeStart').addEventListener('click',()=>state.user?$('addChatBtn').click(
 $('newChatForm').addEventListener('submit',async event=>{event.preventDefault();await startChatById($('friendId').value);});
 $('logoutBtn').addEventListener('click',()=>{if(state.user)signOut();else openModal('authModal');});
 $('profileBtn').addEventListener('click',openProfileEditor);
-$('peerInfoBtn').addEventListener('click',()=>state.peer&&showToast('ID teman: @'+state.peer.username));
+$('peerInfoBtn').addEventListener('click',()=>state.peer&&showPeerFingerprint().catch(error=>showToast(error.message||'Fingerprint gagal dibuat.')));
 $('encodingToggle').addEventListener('click',()=>toggleEncoding(!state.encodingOpen));
 $('closeEncoding').addEventListener('click',()=>toggleEncoding(false));
 $('learnNrz').addEventListener('click',()=>showToast('Buka percakapan anggota dulu, lalu tekan NRZ-I pada pesan yang ingin dilihat.'));
