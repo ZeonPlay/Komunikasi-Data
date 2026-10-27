@@ -15,7 +15,40 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
     }
   }
 });
-const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '' };
+const state = { user: null, profile: null, chats: [], peer: null, messages: [], channel: null, mode: 'signup', encodingOpen: false, encodingText: '', cryptoKey: null, cryptoSalt: null };
+
+// Enkripsi ujung-ke-ujung edukatif: AES-GCM berjalan di browser.
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+function conversationSalt(a,b) { return encoder.encode(['ruang-e2ee-v1', ...[a,b].sort()].join(':')); }
+async function deriveChatKey(passphrase, salt) {
+  const material = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:310000,hash:'SHA-256'}, material, {name:'AES-GCM',length:256}, false, ['encrypt','decrypt']);
+}
+function toBase64(bytes) { let binary=''; for(const byte of bytes) binary+=String.fromCharCode(byte); return btoa(binary); }
+function fromBase64(value) { return Uint8Array.from(atob(value), c=>c.charCodeAt(0)); }
+async function encryptMessage(plain) {
+  if(!state.cryptoKey) throw new Error('Kunci chat belum disiapkan.');
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv},state.cryptoKey,encoder.encode(plain));
+  return 'E2EE1:'+toBase64(new Uint8Array([...iv,...new Uint8Array(encrypted)]));
+}
+async function decryptMessage(message) {
+  if(!message.body?.startsWith('E2EE1:')) return {...message,plaintext:message.body,encrypted:false};
+  try {
+    if(!state.cryptoKey) throw new Error('Kunci tidak tersedia');
+    const packed=fromBase64(message.body.slice(6));
+    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:packed.slice(0,12)},state.cryptoKey,packed.slice(12));
+    return {...message,plaintext:decoder.decode(plain),encrypted:true};
+  } catch { return {...message,plaintext:'🔒 Pesan terkunci — frasa rahasia salah/tidak tersedia',encrypted:true,undecryptable:true}; }
+}
+async function prepareConversationKey(peer) {
+  const passphrase=window.prompt('ENKRIPSI UJUNG-KE-UJUNG (AES-256-GCM)\nMasukkan frasa rahasia bersama untuk chat dengan @'+peer.username+'. Temanmu harus memasukkan frasa yang SAMA. Minimal 8 karakter. Jangan kirim frasa ini lewat chat.');
+  if(!passphrase || passphrase.length<8) { state.cryptoKey=null; showToast('Kunci tidak disiapkan. Chat terenkripsi tidak dapat dibaca/dikirim.'); return false; }
+  state.cryptoSalt=conversationSalt(state.user.id,peer.id);
+  state.cryptoKey=await deriveChatKey(passphrase,state.cryptoSalt);
+  return true;
+}
 const COLORS = ['#354b60','#4a3c61','#31574f','#634a40','#3c4e70','#5c4654'];
 let toastTimer;
 const normalizeId = (value) => value.trim().replace(/^@/, '').toLowerCase();
@@ -111,7 +144,8 @@ async function startChatById(rawId) {
 async function openConversation(peerId) {
   const peer=state.chats.find(chat=>chat.id===peerId);
   if(!peer) return;
-  state.peer=peer; state.messages=[]; state.encodingOpen=false; state.encodingText='';
+  state.peer=peer; state.messages=[]; state.cryptoKey=null;
+  await prepareConversationKey(peer); state.encodingOpen=false; state.encodingText='';
   $('encodingPanel').classList.add('hidden');
   $('encodingToggle').classList.remove('active');
   $('encodingToggle').setAttribute('aria-expanded','false');
@@ -126,7 +160,7 @@ async function openConversation(peerId) {
   if(state.channel){await supabase.removeChannel(state.channel);state.channel=null;}
   const {data,error}=await supabase.from('messages').select('id,sender_id,recipient_id,body,created_at').or(`and(sender_id.eq.${state.user.id},recipient_id.eq.${peer.id}),and(sender_id.eq.${peer.id},recipient_id.eq.${state.user.id})`).order('created_at',{ascending:true}).limit(300);
   if(error){showToast('Gagal memuat pesan. Periksa kebijakan RLS database.');return;}
-  state.messages=data||[]; renderMessages();
+  state.messages=await Promise.all((data||[]).map(decryptMessage)); renderMessages();
   state.channel=supabase.channel('chat:'+ [state.user.id,peer.id].sort().join(':'))
     .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:`recipient_id=eq.${state.user.id}`},payload=>handleIncoming(payload.new))
     .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:`sender_id=eq.${state.user.id}`},payload=>handleIncoming(payload.new))
@@ -135,7 +169,7 @@ async function openConversation(peerId) {
 function handleIncoming(message) {
   if(!state.peer||![state.user.id,state.peer.id].includes(message.sender_id)||![state.user.id,state.peer.id].includes(message.recipient_id)) return;
   if(state.messages.some(item=>item.id===message.id)) return;
-  state.messages.push(message);state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));renderMessages();
+  decryptMessage(message).then(decoded=>{ if(state.messages.some(item=>item.id===decoded.id)) return; state.messages.push(decoded);state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));renderMessages(); });
   if(message.sender_id!==state.user.id) renderChats();
 }
 function renderMessages() {
@@ -148,7 +182,7 @@ function renderMessages() {
       const time=new Date(message.created_at).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'});
       return `<article class="message-row ${mine?'mine':''}">
         <div class="message-author">${mine?'Kamu':escapeText(state.peer?.display_name||'Teman')}</div>
-        <div class="message-bubble">${escapeText(message.body)}</div>
+        <div class="message-bubble">${escapeText(message.plaintext ?? message.body)}</div>
         <div class="message-meta-row">
           <div class="message-time">${time}</div>
           <button type="button" class="message-encoding-toggle" data-encode-index="${index}" aria-label="Lihat visualisasi NRZ-I untuk pesan ${index+1}">NRZ-I</button>
@@ -168,10 +202,12 @@ async function sendMessage(event) {
   const body=$('messageInput').value.trim();
   if(!body||!state.peer||!state.user) return;
   $('sendBtn').disabled=true;
-  const {data,error}=await supabase.from('messages').insert({sender_id:state.user.id,recipient_id:state.peer.id,body}).select('id,sender_id,recipient_id,body,created_at').single();
+  if(!state.cryptoKey) { showToast('Kunci enkripsi belum tersedia. Buka ulang chat dan masukkan frasa rahasia.'); $('sendBtn').disabled=false; return; }
+  let encryptedBody; try { encryptedBody=await encryptMessage(body); } catch(error) { showToast(error.message); $('sendBtn').disabled=false; return; }
+  const {data,error}=await supabase.from('messages').insert({sender_id:state.user.id,recipient_id:state.peer.id,body:encryptedBody}).select('id,sender_id,recipient_id,body,created_at').single();
   $('sendBtn').disabled=false;
   if(error){showToast(error.message.includes('row-level security')?'Pesan ditolak oleh aturan keamanan database. Periksa schema.sql.':'Pesan gagal dikirim. Periksa koneksi.');return;}
-  handleIncoming(data);$('messageInput').value='';resizeComposer();updateCharCount();
+  state.messages.push({...data,plaintext:body,encrypted:true}); state.messages.sort((a,b)=>new Date(a.created_at)-new Date(b.created_at)); renderMessages(); $('messageInput').value='';resizeComposer();updateCharCount();
 }
 function resizeComposer(){const input=$('messageInput');input.style.height='auto';input.style.height=Math.min(input.scrollHeight,130)+'px';}
 function updateCharCount(){$('charCount').textContent=$('messageInput').value.length+' / 2000';}
