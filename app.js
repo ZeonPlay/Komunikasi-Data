@@ -60,6 +60,9 @@ async function ensureIdentity(profile) {
     }
     if(!profile.public_key) await writeProfilePublicKey(profile.id,identity.publicKey);
   } else {
+    if(profile.public_key && !window.confirm('Kunci privat untuk akun ini tidak ditemukan di perangkat ini. Membuat kunci baru akan membuat pesan lama tidak bisa dibuka di perangkat ini dan mengganti kunci publik akun. Lanjutkan hanya jika ini memang perangkat baru atau kamu siap kehilangan akses ke pesan lama.')) {
+      throw new Error('Pembuatan kunci dibatalkan. Gunakan perangkat yang menyimpan kunci privat lama, jika masih tersedia.');
+    }
     const pair=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
     const publicKey=toBase64(new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey)));
     identity={userId:profile.id,privateKey:pair.privateKey,publicKey};
@@ -205,6 +208,13 @@ async function startChatById(rawId) {
     renderChats(); closeModal('newChatModal'); feedback('newChatFeedback','');
     await openConversation(friend.id); $('sidebar').classList.remove('open');
   } catch(error){feedback('newChatFeedback',error.message||'Pencarian gagal. Periksa koneksi dan database.');}
+}
+async function showPeerFingerprint() {
+  if(!state.peer?.public_key) { showToast('Teman belum memiliki kunci publik.'); return; }
+  const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',fromBase64(state.peer.public_key)));
+  const hex=Array.from(digest,byte=>byte.toString(16).padStart(2,'0').toUpperCase()).join('');
+  const fingerprint=hex.match(/.{1,4}/g).join(' ');
+  window.alert('Fingerprint kunci publik @'+state.peer.username+'\n\n'+fingerprint+'\n\nBandingkan fingerprint ini dengan teman melalui kanal lain (misalnya bertemu langsung atau panggilan yang kamu yakini aman). Jika tidak cocok, jangan kirim pesan sensitif.');
 }
 async function openConversation(peerId) {
   const peer=state.chats.find(chat=>chat.id===peerId);
@@ -412,7 +422,7 @@ $('welcomeStart').addEventListener('click',()=>state.user?$('addChatBtn').click(
 $('newChatForm').addEventListener('submit',async event=>{event.preventDefault();await startChatById($('friendId').value);});
 $('logoutBtn').addEventListener('click',()=>{if(state.user)signOut();else openModal('authModal');});
 $('profileBtn').addEventListener('click',openProfileEditor);
-$('peerInfoBtn').addEventListener('click',()=>state.peer&&showToast('ID teman: @'+state.peer.username));
+$('peerInfoBtn').addEventListener('click',()=>state.peer&&showPeerFingerprint().catch(error=>showToast(error.message||'Fingerprint gagal dibuat.')));
 $('encodingToggle').addEventListener('click',()=>toggleEncoding(!state.encodingOpen));
 $('closeEncoding').addEventListener('click',()=>toggleEncoding(false));
 $('learnNrz').addEventListener('click',()=>showToast('Buka percakapan anggota dulu, lalu tekan NRZ-I pada pesan yang ingin dilihat.'));
